@@ -1,0 +1,335 @@
+program SalesOrder_IssueDocuments_SP13;
+info
+  Title = 'Vydání zvolených dokumentů nad zakázkou - SP13';               // Script Title
+  Keywords = '.salesorder';            // Script Keywords
+  Author = 'Robert Urmanič';            // Script Author
+  AS3Compatible = False;      // Script is runable under AS
+end;
+
+uses
+  numfield,
+  FM_INVOICEOUT,
+  FM_RELEASENOTE,
+  FM_DELIVERYNOTE,
+  FM_RESERVINGCARD,
+  FM_BOOKCONFIGURATION,
+  U_DVCConnector;
+
+modules
+  SalOrdDM: TSalesOrderDM,
+  InvOutDM: TInvoiceOutDM,
+  ReleaseNoteDM, RNtemp: TReleaseNoteDM,
+  DeliveryNoteDM: TDeliveryNoteDM,
+  ReservingCardDM, RCtemp: TReservingCardDM;
+
+type
+  TDocumentForm = class(TScriptPersistent)
+  private
+    CheckBoxRelNote: Boolean;
+    CheckBoxDelNote: Boolean;
+    CheckBoxInvoice: Boolean;
+    WarehouseId: Integer;
+  protected
+    procedure DefineObjectProperties(AInterface: TObjectUserInterface); override;
+  published
+    property RNCheckBox: Boolean read CheckBoxRelNote write CheckBoxRelNote {$Desc 'Skladový doklad'};
+    property DNCheckBox: Boolean read CheckBoxDelNote write CheckBoxDelNote {$Desc 'Dodací list'};
+    property ICheckBox: Boolean read CheckBoxInvoice write CheckBoxInvoice {$Desc 'Faktura'};
+    property WId: Integer read WarehouseId write WarehouseId {$Desc 'Sklad'};
+  end;
+
+var
+  DocumentForm: TDocumentForm;
+  NewReleaseNote: Int64;
+  NewInvoice: Int64;
+  NewDeliveryNote: Int64;
+  AmE: TAmExecutor;
+  ReservationCardRID: Int64 = 0;
+  Errt: Boolean;
+  releaseNoteResult: TUFViewResult;
+  itemsWithCancelledInvoices: String = '';
+  DocumentRid: Int64;
+  PrintFromNewOnly: Boolean;
+  uncreatedDocuments: String;
+  LStream: TStringStream;
+
+const
+  AMGUID_Paragon = '{E9D4856D-5427-4034-9EE5-6A7717AAE62E}';
+
+procedure callSkippedItems();
+begin
+if itemsWithCancelledInvoices <> '' then
+  begin
+    SetLength(itemsWithCancelledInvoices,LENGTH(itemsWithCancelledInvoices)-2);
+    TUniFormManager.DialogExecutor.ShowMessageModalOK('Položkám se stornovanou fakturou nebyly vytvořeny doklady. Položky: ' + itemsWithCancelledInvoices);
+  end;
+end;
+
+function insertDoc(dtps: TDocumentTypePS): Int64;
+begin
+  case dtps of
+    dtpsInvoice: if (SalOrdDM.SalesItemChild.InvoiceOutRID <> 0) then exit else
+    begin
+      DocumentRid:= SalOrdDM.SubalternDocumentDataModule.GetInvoice.FindFirstAcceptable(SalOrdDM.BookId, 0);
+
+      if DocumentRid = 0 then
+      begin
+        DocumentRid:= SalOrdDM.SubalternDocumentDataModule.GetInvoice.CreateNew(SalOrdDM.BookId, 0);
+      end;
+    end;
+    dtpsStock: if (SalOrdDM.SalesItemChild.ReleaseNoteRID <> 0) or (SalOrdDM.SalesItemChild.ReservingCardRID <> 0) then exit else
+    begin
+      DocumentRid:= SalOrdDM.SubalternDocumentDataModule.GetStockDoc.FindFirstAcceptable(SalOrdDM.BookId, DocumentForm.WId);
+
+      if DocumentRid = 0 then
+      begin
+        DocumentRid:= SalOrdDM.SubalternDocumentDataModule.GetStockDoc.CreateNew(SalOrdDM.BookId, DocumentForm.WId);
+      end;
+    end;
+    dtpsDelivery: if (SalOrdDM.SalesItemChild.DeliveryNoteRID <> 0) then exit else
+    begin
+      DocumentRid:= SalOrdDM.SubalternDocumentDataModule.GetDeliveryNote.FindFirstAcceptable(SalOrdDM.BookId, DocumentForm.WId);
+
+      if DocumentRid = 0 then
+      begin
+        DocumentRid:= SalOrdDM.SubalternDocumentDataModule.GetDeliveryNote.CreateNew(SalOrdDM.BookId, DocumentForm.WId);
+      end;
+    end;
+  end;
+
+  result:= DocumentRid;
+
+  with SalOrdDM.SalesItemChild do (remEdit)
+  begin
+    SalOrdDM.SalesItemChild.AddItemToDocument(dtps, DocumentRid);
+  end;
+  if SalOrdDM.SalesItemChild.ReservingCardRID <> 0 then
+  begin
+    ReservationCardRID:= SalOrdDM.SalesItemChild.ReservingCardRID;
+  end;
+end;
+
+function fillDocumentsGetRID(dtps: TDocumentTypePS): Int64;
+var
+  RIDholder: Int64;
+begin
+  DocumentRid:= 0;
+  SalOrdDM.SalesItemChild.SetFirst;
+    if SalOrdDM.SalesItemChild.SelectionCount > 0 then
+    begin
+      SalOrdDM.SalesItemChild.SetFirstSelected;
+      while SalOrdDM.SalesItemChild.DoNextSelected do
+      begin
+        result:= insertDoc(dtps);
+        if result <> 0 then RIDholder:= result;
+      end;
+    end else
+    begin
+      while SalOrdDM.SalesItemChild.DoNext do
+      begin
+        result:= insertDoc(dtps);
+        if result <> 0 then RIDholder:= result;
+      end;
+    end;
+  if RIDholder <> 0 then Result:= RIDholder; {$Message 'rychlý hloupý fix'}
+end;
+
+procedure TDocumentForm.DefineObjectProperties(AInterface: TObjectUserInterface);
+var
+  LDataProp: TObjectPropK2;
+begin
+   inherited DefineObjectProperties(AInterface);
+   LDataProp := Self.GetPropInfo(AInterface, WId);
+   AddDynamicLink(cD_Warehouse, [LDataProp.Field], False);
+end;
+
+{ $Define turnOffPrint}
+
+procedure ReportPrint(ReportName: String; DM: TDataM);
+var
+  lF9am : TBShortcutAmReportNV;
+  lSR: TSignatureReport;
+  lstr: String;
+begin
+//  begin
+//    begin
+//      AmE := TAmExecutor.Create;
+//      try
+//        AmE.CurrentDM := DM;
+//        AmE.OpenReport(ReportName);
+//        AmE.Execute;
+//        AmE.ToExport('', 0, 9999, extyPDF, exdeToApplication, '');
+//        AmE.ToPrinter('', 100, '');
+//      finally
+//        AmE.Free;
+//        lSR.Free;
+//      end;
+//    end;
+//  end;
+  if AmE.OpenReport(ReportName) then
+  begin
+    AmE.CurrentDM   := DM;
+    AmE.CurrentForm := nil;
+    AmE.CurrentPage  := 1;
+
+    AmE.MainReport.PrintOptions.Copies   := 1;  // nastaveni tiskarny
+
+    AmE.Execute;
+
+    AmE.ToExport('', 0, 9999, extyPDF,exdeToFile, 'test' + '.pdf');
+  end;
+
+
+  {$ifndef turnOffPrint}
+
+  AmE.ToPrinter('', 100, '');
+  {$endif}
+  AmE.CloseReport;
+end;
+
+{ $Define debug}
+
+
+
+var
+  Book: TBooks;
+  SBC: TSaleBookConfiguration;
+  temp: Integer;
+  year: Integer;
+
+begin
+  AmE := TAmExecutor.Create;
+  InvOutDM.CreateDM;
+  ReleaseNoteDM.CreateDM;
+  DeliveryNoteDM.CreateDM;
+  ReservingCardDM.CreateDM;
+  RNtemp.CreateDM;
+  RCtemp.CreateDM;
+  Book:= TBooks.Create;
+
+  LStream := TStringStream.Create('');
+
+  if not (CurrentDM is 'TSalesOrderDM') then
+  begin
+    CurrentDM.Information('Spusťte skript nad zakázkami.', mtWarning);
+    Halt;
+  end;
+
+  SalOrdDM:= TSalesOrderDM(CurrentDM);
+  DocumentForm:= TDocumentForm.Create(nil);
+  try
+    Book.Load;
+    DecodeDate(now, year, temp, temp);
+    SBC:= Book.GetConfiguration(SalOrdDM.BookId, year - 1900) as TSaleBookConfiguration;
+
+    DocumentForm.WId:= SBC.Warehouse;
+
+    TUniFormManager.DialogExecutor.EditObjectModal(DocumentForm, 'Vyberte doklady, které chcete vytvořit');
+
+    if DocumentForm.RNCheckBox and (DocumentForm.WId = 0) then
+    begin
+      TUniFormManager.DialogExecutor.ShowMessageModalOK('Pro tvorbu skladových dokladů je zapotřebí zvolit sklad!', dmtWarning);
+      Halt;
+    end;
+
+    WTransaBegin(wtTransaction, 'transactionCreateDocuments'); // Zacatek blokovani frontou i zacatek transakce
+                                         // !POZOR!  jakekoli hlaseni EIS K2 uvnitr transakce zpusobi
+                                         // zastaveni behu traansakce a muze vest k zastaveni behu firmy
+    ErrT := True;                        // Nastavit priznak chyby
+    try
+      if DocumentForm.RNCheckBox then
+      begin
+        with SalOrdDM do (remEdit)
+        begin
+          ReleaseNoteDM.CurrentIndex:= REL_ByRID;
+          ReleaseNoteDM.RID:= fillDocumentsGetRID(dtpsStock);
+        end;
+
+        if ReleaseNoteDM.RID <> 0 then
+        begin
+          ReservingCardDM.CurrentIndex:= RESC_ByRID;
+          ReservingCardDM.RID:= ReservationCardRID;
+          if ReservingCardDM.DoGetKey and ReleaseNoteDM.DoGetKey then
+          begin
+            ReservingCardDM.Confirm;
+            ReleaseNoteDM.Confirm;
+            ReportPrint('Vyd_toPrint.AM', ReleaseNoteDM);                                     {$Message ''}
+            ReportPrint('REZ_DOK01.AM', ReservingCardDM);
+          end else if ReleaseNoteDM.DoGetKey then
+          begin
+            ReleaseNoteDM.Confirm;
+            ReportPrint('Vyd_toPrint.AM', ReleaseNoteDM);
+          end else if ReservingCardDM.DoGetKey then
+          begin
+            ReservingCardDM.Confirm;
+            ReportPrint('REZ_DOK01.AM', ReservingCardDM);
+          end else RDSMessage(CurrentDM, 'Nenalezena ani výdejka ani rezervační list');
+        end else uncreatedDocuments:= uncreatedDocuments + ' skladové doklady, ';  //všechny položky již mají vytvořeny
+      end;
+
+      if DocumentForm.DNCheckBox then
+      begin
+        with SalOrdDM do (remEdit)
+        begin
+          DeliveryNoteDM.CurrentIndex:= DLN_ByRID;
+          DeliveryNoteDM.RID:= fillDocumentsGetRID(dtpsDelivery);
+        end;
+
+        if DeliveryNoteDM.RID <> 0 then
+        begin
+          if not DeliveryNoteDM.DoGetKey then RDSMessage(CurrentDM, 'Nenalezen dodací list');
+
+          DeliveryNoteDM.Confirm;
+          ReportPrint('DLV_DOK01.AM', DeliveryNoteDM);
+        end else uncreatedDocuments:= uncreatedDocuments + ' dodací listy, ';
+      end;
+
+      if DocumentForm.ICheckBox then
+      begin
+        with SalOrdDM do (remEdit)
+        begin
+          InvOutDM.CurrentIndex:= IVO_ByRID;
+          InvOutDM.RID:= fillDocumentsGetRID(dtpsInvoice);
+        end;
+
+        if InvOutDM.RID <> 0 then
+        begin
+          if not InvOutDM.DoGetKey then RDSMessage(CurrentDM, 'Nenalezena faktura');
+
+          ReportPrint('FV_toPrint.AM', InvOutDM);
+        end else uncreatedDocuments:= uncreatedDocuments + ' faktury, ';
+      end;
+    ErrT         := False;             // Zrusit priznak chyby
+    finally
+      if IsTransaction then              // Jsou - li zapnuty transakce
+        if ErrT then                     // Je li chyba
+          WTransaRollback                // Vyrolovani vsech zmen od wtBeginTransaction
+        else                             // Neni li chyba
+          WTransaCommit                  // Akceptovani vsech zmen od  wtBeginTransaction
+        ;
+      ;
+    end;
+
+    if DocumentForm.ICheckBox and (ErrT = False) then InvOutDM.Confirm;
+
+//
+//  if DocumentForm.RNCheckBox then InvOutDM.Confirm;
+//  if DocumentForm.DNCheckBox then InvOutDM.Confirm;
+//  if DocumentForm.ICheckBox then InvOutDM.Confirm;
+
+  if uncreatedDocuments <> '' then
+  begin
+    SetLength(uncreatedDocuments, length(uncreatedDocuments) - 2);
+    TUniFormManager.DialogExecutor.ShowMessageModalOK('Již jsou vytvořeny:' + uncreatedDocuments + '.');
+  end;
+
+  callSkippedItems();
+
+  finally
+    DocumentForm.Free;
+    ReleaseNoteDM.Free;
+    DeliveryNoteDM.Free;
+    Book.Free;
+    LStream.Free;
+  end;
+end.
